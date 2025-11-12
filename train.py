@@ -1,0 +1,248 @@
+# train_cifar_resnet_fig7_paper_exact_fixed.py
+import os, torch, torch.nn as nn, torch.nn.functional as F, torchvision as tv, torch.optim as optim
+from torch.utils.data import DataLoader
+
+from tqdm import tqdm
+
+# ------------------ CIFAR-style blocks ------------------
+def conv3x3(ic, oc, s=1): return nn.Conv2d(ic, oc, 3, stride=s, padding=1, bias=False)
+
+class OptionA(nn.Module):
+    """Identity shortcut with stride-2 spatial downsampling and zero-channel pad."""
+    def __init__(self, in_c, out_c, stride):
+        super().__init__()
+        self.in_c, self.out_c, self.stride = in_c, out_c, stride
+        self.delta_c = out_c - in_c
+        assert self.delta_c >= 0, "OptionA expects out_c >= in_c"
+    def forward(self, x):
+        if self.stride == 2:
+            x = x[:, :, ::2, ::2]                   # downsample spatially
+        if self.delta_c > 0:
+            pad = torch.zeros(x.size(0), self.delta_c, x.size(2), x.size(3),
+                              dtype=x.dtype, device=x.device)
+            x = torch.cat([x, pad], dim=1)          # zero-pad channels
+        return x
+
+class RBlock(nn.Module):  # residual basic block (ResNet v1)
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.c1, self.b1 = conv3x3(in_c,out_c,stride), nn.BatchNorm2d(out_c)
+        self.c2, self.b2 = conv3x3(out_c,out_c,1),     nn.BatchNorm2d(out_c)
+        self.short = nn.Identity() if (stride==1 and in_c==out_c) else OptionA(in_c,out_c,stride)
+    def forward(self, x):
+        y = F.relu(self.b1(self.c1(x)))
+        y = self.b2(self.c2(y))            # BN after 2nd conv, before add
+        y = y + self.short(x)
+        return F.relu(y)
+
+class PBlock(nn.Module):  # plain block (no residual add)
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.c1, self.b1 = conv3x3(in_c,out_c,stride), nn.BatchNorm2d(out_c)
+        self.c2, self.b2 = conv3x3(out_c,out_c,1),     nn.BatchNorm2d(out_c)
+    def forward(self, x):
+        x = F.relu(self.b1(self.c1(x))); x = F.relu(self.b2(self.c2(x))); return x
+
+def make_layer(block, in_c, out_c, n, stride):
+    layers = [block(in_c,out_c,stride)]
+    layers += [block(out_c,out_c,1) for _ in range(n-1)]
+    return nn.Sequential(*layers)
+
+class CIFARNet(nn.Module):
+    # depth = 6n+2  (n in {3,9,18})
+    def __init__(self, n, residual=True, num_classes=10):
+        super().__init__()
+        B = RBlock if residual else PBlock
+        self.conv1 = nn.Conv2d(3,16,3,padding=1,bias=False); self.bn1=nn.BatchNorm2d(16)
+        self.stage1 = make_layer(B,16,16,n,1)
+        self.stage2 = make_layer(B,16,32,n,2)
+        self.stage3 = make_layer(B,32,64,n,2)
+        self.fc = nn.Linear(64,num_classes)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.); nn.init.constant_(m.bias, 0.)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.stage1(x); x = self.stage2(x); x = self.stage3(x)
+        x = F.adaptive_avg_pool2d(x,1).flatten(1)
+        return self.fc(x)
+
+# ------------------ Data ------------------
+def get_loaders(batch_size=128, workers=2):
+    tf_train = tv.transforms.Compose([
+        tv.transforms.RandomCrop(32, padding=4),
+        tv.transforms.RandomHorizontalFlip(),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010)),
+    ])
+    tf_test = tv.transforms.Compose([
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010)),
+    ])
+    trainset = tv.datasets.CIFAR10('./data', train=True, download=True, transform=tf_train)
+    testset  = tv.datasets.CIFAR10('./data', train=False, download=True, transform=tf_test)
+    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True,  num_workers=workers, pin_memory=True, drop_last=True)
+    testloader  = DataLoader(testset,  batch_size=256,      shuffle=False, num_workers=workers, pin_memory=True)
+    return trainloader, testloader
+
+# ------------------ Iteration-based training ------------------
+@torch.no_grad()
+def eval_top1(model, loader, device):
+    model.eval(); corr=total=0
+    for x,y in loader:
+        x,y=x.to(device),y.to(device)
+        corr += (model(x).argmax(1)==y).sum().item(); total += y.numel()
+    return corr/total
+
+from tqdm.auto import tqdm
+
+def train_iterations_tqdm(model, trainloader, testloader, total_steps=64000, base_lr=0.1, device='cuda'):
+    model.to(device).train()
+    # exclude BN from weight decay (stable training)
+    bn, rest = [], []
+    for n, p in model.named_parameters():
+        (bn if ('.bn' in n or n.endswith('bn1.weight') or n.endswith('bn2.weight') or 'bn' in n) else rest).append(p)
+    opt = optim.SGD([{'params': rest, 'weight_decay': 1e-4},
+                     {'params': bn,   'weight_decay': 0.0}],
+                    lr=base_lr, momentum=0.9)
+
+    def infinite_batches(dl):
+        while True:
+            for b in dl:
+                yield b
+
+    it = infinite_batches(trainloader)
+    torch.backends.cudnn.benchmark = True
+
+    # tiny warmup only for very deep nets (e.g., 110-layer)
+    warmup_steps = 400 if sum(p.numel() for p in model.parameters()) > 1_000_000 else 0
+
+    # for a readable loss on the bar
+    ema_loss = None
+    progress = tqdm(range(total_steps), mininterval=30, desc="Training", leave=True, smoothing=0.1)
+
+    for step in progress:
+        # LR schedule: 0..31999: 0.1; 32000..47999: 0.01; 48000..63999: 0.001
+        if warmup_steps and step < warmup_steps:
+            lr = 0.01
+        elif step >= 48000:
+            lr = base_lr * 1e-3
+        elif step >= 32000:
+            lr = base_lr * 1e-2
+        else:
+            lr = base_lr
+        for g in opt.param_groups:
+            g['lr'] = lr
+
+        x, y = next(it)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)
+        loss.backward()
+        opt.step()
+
+        # update progress bar (EMA for stability)
+        loss_val = loss.detach().item()
+        ema_loss = loss_val if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_val)
+        progress.set_postfix(lr=f"{lr:.4g}", loss=f"{ema_loss:.4f}")
+
+        # periodic eval prints without breaking the bar
+        if (step + 1) % 5000 == 0 or step in (0, 31999, 47999):
+            model.eval()
+            acc = eval_top1(model, testloader, device)
+            # use progress.write so it doesn't clash with the bar
+            progress.write(f"[iter {step+1:5d}] lr={lr:.5f}  test@1={acc*100:.2f}%")
+            model.train()
+
+    model.eval()
+    return model
+
+
+def train_iterations(model, trainloader, testloader, total_steps=64000, base_lr=0.1, device='cuda'):
+    model.to(device).train()
+    # exclude BN from weight decay (stable training)
+    bn, rest = [], []
+    for n, p in model.named_parameters():
+        (bn if ('.bn' in n or n.endswith('bn1.weight') or n.endswith('bn2.weight') or 'bn' in n) else rest).append(p)
+    opt = optim.SGD([{'params': rest, 'weight_decay': 1e-4},
+                     {'params': bn,   'weight_decay': 0.0}],
+                    lr=base_lr, momentum=0.9)
+
+    def infinite_batches(dl):
+        while True:
+            for b in dl:
+                yield b
+
+    it = infinite_batches(trainloader)
+    torch.backends.cudnn.benchmark = True
+
+    warmup_steps = 400 if sum(p.numel() for p in model.parameters()) > 1_000_000 else 0
+
+    ema_loss = None
+    print_interval = 1000  # print every 1000 iterations
+
+    for step in range(total_steps):
+        # LR schedule
+        if warmup_steps and step < warmup_steps:
+            lr = 0.01
+        elif step >= 48000:
+            lr = base_lr * 1e-3
+        elif step >= 32000:
+            lr = base_lr * 1e-2
+        else:
+            lr = base_lr
+        for g in opt.param_groups:
+            g['lr'] = lr
+
+        x, y = next(it)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)
+        loss.backward()
+        opt.step()
+
+        # EMA loss for stability
+        loss_val = loss.detach().item()
+        ema_loss = loss_val if ema_loss is None else (0.9 * ema_loss + 0.1 * loss_val)
+
+        # periodic print
+        if (step + 1) % print_interval == 0 or step in (0, 31999, 47999):
+            print(f"[{step+1:5d}/{total_steps}] lr={lr:.4g} loss={ema_loss:.4f} ")
+
+        # periodic eval
+        if (step + 1) % 5000 == 0 or step in (0, 31999, 47999):
+            model.eval()
+            acc = eval_top1(model, testloader, device)
+            print(f"    Eval @ iter {step+1:5d}: test@1={acc*100:.2f}%")
+            model.train()
+
+    model.eval()
+    return model
+
+
+# ------------------ Run all Figure-7 models ------------------
+def main():
+    os.makedirs('checkpoints', exist_ok=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    trainloader, testloader = get_loaders(batch_size=128, workers=2)
+    cfg = {
+        # 'plain-20':   (3, False),
+        'plain-56':   (9, False),
+        'ResNet-20':  (3, True),
+        'ResNet-56':  (9, True),
+        'ResNet-110': (18, True),
+    }
+    for name,(n,residual) in cfg.items():
+        print(f"\n=== Training {name} (paper-accurate: Option A, 64k iters) ===")
+        model = CIFARNet(n=n, residual=residual)
+        model = train_iterations(model, trainloader, testloader, total_steps=64000, base_lr=0.1, device=device)
+        torch.save(model.state_dict(), f"checkpoints/{name}.pth")
+        print(f"Saved: checkpoints/{name}.pth")
+
+if __name__ == "__main__":
+    main()
