@@ -3,6 +3,7 @@ import os, torch, torch.nn as nn, torch.nn.functional as F, torchvision as tv, t
 from torch.utils.data import DataLoader
 
 from tqdm import tqdm
+import json
 
 # ------------------ CIFAR-style blocks ------------------
 def conv3x3(ic, oc, s=1): return nn.Conv2d(ic, oc, 3, stride=s, padding=1, bias=False)
@@ -13,6 +14,7 @@ class OptionA(nn.Module):
         super().__init__()
         self.in_c, self.out_c, self.stride = in_c, out_c, stride
         self.delta_c = out_c - in_c
+        
         assert self.delta_c >= 0, "OptionA expects out_c >= in_c"
     def forward(self, x):
         if self.stride == 2:
@@ -23,52 +25,92 @@ class OptionA(nn.Module):
             x = torch.cat([x, pad], dim=1)          # zero-pad channels
         return x
 
+def get_act_layer(name):
+    if name == 'relu': return nn.ReLU(inplace=True)
+    if name == 'gelu': return nn.GELU()
+    if name == 'silu': return nn.SiLU(inplace=True) # Also known as Swish
+    raise ValueError(f"Unknown activation: {name}")
+
 class RBlock(nn.Module):  # residual basic block (ResNet v1)
-    def __init__(self, in_c, out_c, stride=1):
+    def __init__(self, in_c, out_c, stride=1, act_name='relu'):
         super().__init__()
         self.c1, self.b1 = conv3x3(in_c,out_c,stride), nn.BatchNorm2d(out_c)
         self.c2, self.b2 = conv3x3(out_c,out_c,1),     nn.BatchNorm2d(out_c)
+        # Modular activations
+        self.act1 = get_act_layer(act_name)
+        self.act2 = get_act_layer(act_name)
         self.short = nn.Identity() if (stride==1 and in_c==out_c) else OptionA(in_c,out_c,stride)
     def forward(self, x):
-        y = F.relu(self.b1(self.c1(x)))
+        y = self.act1(self.b1(self.c1(x)))
         y = self.b2(self.c2(y))            # BN after 2nd conv, before add
         y = y + self.short(x)
-        return F.relu(y)
+        return self.act2(y)
 
 class PBlock(nn.Module):  # plain block (no residual add)
-    def __init__(self, in_c, out_c, stride=1):
+    def __init__(self, in_c, out_c, stride=1, act_name='relu'):
         super().__init__()
         self.c1, self.b1 = conv3x3(in_c,out_c,stride), nn.BatchNorm2d(out_c)
         self.c2, self.b2 = conv3x3(out_c,out_c,1),     nn.BatchNorm2d(out_c)
+    # Modular activations
+        self.act1 = get_act_layer(act_name)
+        self.act2 = get_act_layer(act_name)
     def forward(self, x):
-        x = F.relu(self.b1(self.c1(x))); x = F.relu(self.b2(self.c2(x))); return x
+        x = self.act1(self.b1(self.c1(x))); x = self.act2(self.b2(self.c2(x))); return x
 
-def make_layer(block, in_c, out_c, n, stride):
-    layers = [block(in_c,out_c,stride)]
-    layers += [block(out_c,out_c,1) for _ in range(n-1)]
+def make_layer(block, in_c, out_c, n, stride, act_name):
+    layers = [block(in_c, out_c, stride, act_name=act_name)]
+    layers += [block(out_c, out_c, 1, act_name=act_name) for _ in range(n-1)]
     return nn.Sequential(*layers)
 
 class CIFARNet(nn.Module):
-    # depth = 6n+2  (n in {3,9,18})
-    def __init__(self, n, residual=True, num_classes=10):
+    def __init__(self, n, residual=True, num_classes=10, act_name='relu'):
         super().__init__()
         B = RBlock if residual else PBlock
-        self.conv1 = nn.Conv2d(3,16,3,padding=1,bias=False); self.bn1=nn.BatchNorm2d(16)
-        self.stage1 = make_layer(B,16,16,n,1)
-        self.stage2 = make_layer(B,16,32,n,2)
-        self.stage3 = make_layer(B,32,64,n,2)
-        self.fc = nn.Linear(64,num_classes)
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(16)
+        self.act1  = get_act_layer(act_name) # Modularize stem activation too
+        
+        self.stage1 = make_layer(B, 16, 16, n, 1, act_name)
+        self.stage2 = make_layer(B, 16, 32, n, 2, act_name)
+        self.stage3 = make_layer(B, 32, 64, n, 2, act_name)
+        self.fc = nn.Linear(64, num_classes)
+        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1.); nn.init.constant_(m.bias, 0.)
+                nn.init.constant_(m.weight, 1.)
+                nn.init.constant_(m.bias, 0.)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.stage1(x); x = self.stage2(x); x = self.stage3(x)
-        x = F.adaptive_avg_pool2d(x,1).flatten(1)
+        x = self.act1(self.bn1(self.conv1(x)))
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = F.adaptive_avg_pool2d(x, 1).flatten(1)
         return self.fc(x)
+
+class StdRecorder:
+    def __init__(self, model):
+        self.hooks = []
+        self.data = {} 
+        self.counter = 0
+        
+        for name, module in model.named_modules():
+            if name in ['stage1', 'stage2', 'stage3']:
+                self.hooks.append(module.register_forward_hook(self._get_hook(name)))
+    
+    def _get_hook(self, name):
+        def hook(model, input, output):
+            self.counter += 1
+            if self.counter % 100 == 0: 
+                std_val = output.detach().std().item()
+                if name not in self.data: self.data[name] = []
+                self.data[name].append(std_val)
+        return hook
+        
+    def close(self):
+        for h in self.hooks: h.remove()      
 
 # ------------------ Data ------------------
 def get_loaders(batch_size=128, workers=2):
@@ -243,6 +285,35 @@ def main():
         model = train_iterations(model, trainloader, testloader, total_steps=64000, base_lr=0.1, device=device)
         torch.save(model.state_dict(), f"checkpoints/{name}.pth")
         print(f"Saved: checkpoints/{name}.pth")
+    
+    # Compare Plain-20 with different activations to see degradation
+    experiments = [
+        # ('ResNet-20', 3, True, 'gelu'),
+        ('ResNet-20', 3, True, 'silu'),
+        # ('ResNet-20', 3, True, 'relu'), # Baseline
+    ]
+
+    results = {}
+
+    for name, n, residual, act in experiments:
+        run_name = f"{name}_{act}"
+        print(f"\n=== Training {run_name} ===")
+        model = CIFARNet(n=n, residual=residual, act_name=act)
+        recorder = StdRecorder(model)
+        
+        # Run training (Set total_steps=64000 for paper reproduction)
+        model = train_iterations(model, trainloader, testloader, total_steps=64000, base_lr=0.1, device=device)
+        # Save Stats
+        results[run_name] = recorder.data
+        recorder.close() # Clean up hooks
+        
+        torch.save(model.state_dict(), f"checkpoints/{run_name}.pth")
+
+    # Save std_dev data to json for plotting later
+    with open('std_dev_results.json', 'w') as f:
+        json.dump(results, f)
+    print("Experiments finished. Results saved to std_dev_results.json")
+
 
 if __name__ == "__main__":
     main()
